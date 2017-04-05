@@ -1,0 +1,582 @@
+/*
+What id difference THREADID and THREADIDREF?
+
+
+
+
+*/
+
+
+
+#include "VirtualMachine.h"
+#include "Machine.h"
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <dlfcn.h>
+#include <iostream>
+#include <vector>
+#include <queue>
+
+using namespace std;
+
+volatile int sleepCount = 10;
+volatile int go = -1;
+volatile TVMTickRef globalTicks = 0;
+
+
+extern "C"{
+	TVMStatus VMStart(int tickms, int argc, char *argv[]);
+
+	TVMStatus VMTickMS(int *tickmsref);
+	TVMStatus VMTickCount(TVMTickRef tickref);
+
+	TVMStatus VMThreadCreate(TVMThreadEntry entry, void *param, TVMMemorySize memsize, TVMThreadPriority prio, TVMThreadIDRef tid);
+	TVMStatus VMThreadDelete(TVMThreadID thread);
+	TVMStatus VMThreadActivate(TVMThreadID thread);
+	TVMStatus VMThreadTerminate(TVMThreadID thread);
+	TVMStatus VMThreadID(TVMThreadIDRef threadref);
+	TVMStatus VMThreadState(TVMThreadID thread, TVMThreadStateRef stateref);
+	TVMStatus VMThreadSleep(TVMTick tick);
+
+	TVMStatus VMMutexCreate(TVMMutexIDRef mutexref);
+	TVMStatus VMMutexDelete(TVMMutexID mutex);
+	TVMStatus VMMutexQuery(TVMMutexID mutex, TVMThreadIDRef ownerref);
+	TVMStatus VMMutexAcquire(TVMMutexID mutex, TVMTick timeout);     
+	TVMStatus VMMutexRelease(TVMMutexID mutex);
+
+
+	TVMStatus VMFileOpen(const char *filename, int flags, int mode, int *filedescriptor);
+	TVMStatus VMFileClose(int filedescriptor);      
+	TVMStatus VMFileRead(int filedescriptor, void *data, int *length);
+	TVMStatus VMFileWrite(int filedescriptor, void *data, int *length);
+	TVMStatus VMFileSeek(int filedescriptor, int offset, int whence, int *newoffset);
+
+
+	TVMMainEntry VMLoadModule(const char *module);
+	void VMUnloadModule(void);
+	TVMStatus VMFilePrint(int filedescriptor, const char *format, ...);
+
+
+	void CallBackFile(void* ptr, int result);
+	// void VMFileOpenCallBack(void* ptr, int result);
+	// void VMFileWriteCallBack(void* ptr, int result);
+	void VMThreadSleepCallBack(void* ptr);
+	void MachineAlarmCallback(void* ptr);
+
+	void Scheduler();
+	void IdleThreadFunction(void*);
+	void Skeleton(void* ptr);
+
+}
+
+class TCB{
+public:
+	TVMThreadID ID;
+
+	TVMTick mutexWaitTicks;
+
+	SMachineContextRef mcntxref;
+	TVMThreadState state;
+	TVMStatus status;
+	TVMThreadPriority priority;
+	TVMMemorySize memSize;
+	TVMTick sleepTicks;
+	TVMThreadEntry entry;
+	sigset_t signalState;
+	void* param;
+	int result;
+};
+class mutex{
+public:
+	TVMMutexID ID;
+	queue<TCB*> highPriority;
+	queue<TCB*> mediumPriority;
+	queue<TCB*> lowPriority;
+	TCB* curHolder;
+	int state;// 0 is unlock state and 1 is lock state;
+
+};
+std::vector<mutex*> allMutexs;
+vector<TCB*> allThreads;
+priority_queue<TCB*> highThreads;
+priority_queue<TCB*> mediumThreads;
+priority_queue<TCB*> lowThreads;
+vector<TCB*> sleepThreads;
+
+TCB *MainThread = new TCB();
+TCB *IdleThread;
+TCB *curThread;
+
+
+TVMStatus VMStart(int tickms, int argc, char *argv[]){
+	MachineInitialize();
+	TVMMainEntry ptr = VMLoadModule(argv[0]);
+	if(ptr == NULL){
+		MachineTerminate();
+		return VM_STATUS_FAILURE;
+	}
+
+	else{
+
+		// CREATE MAIN THREAD
+		MainThread->ID = 0;
+		MainThread->priority = VM_THREAD_PRIORITY_NORMAL; // MAYBE CHANGE
+		MainThread->state = VM_THREAD_STATE_RUNNING;
+		MainThread->memSize = 0x100000;
+		MainThread->mcntxref = new SMachineContext;
+		MainThread->entry = NULL;
+
+		allThreads.push_back(MainThread);
+		//mediumThreads.push(MainThread);
+
+		//Create context of main thread
+		char *stackArray = new char[MainThread->memSize]; 
+		MachineContextCreate(MainThread->mcntxref, NULL, MainThread->param, 
+			stackArray, MainThread->memSize);
+
+		curThread = MainThread;
+
+		// Create idle thread
+		TVMThreadID idle = 99;
+		VMThreadCreate(IdleThreadFunction, NULL, 0x100000, VM_THREAD_PRIORITY_IDLE, &idle);
+		VMThreadActivate(idle);
+
+
+		MachineRequestAlarm(tickms*1000, MachineAlarmCallback, NULL);
+		MachineEnableSignals(); 
+		ptr(argc, argv);
+		MachineTerminate();
+		return VM_STATUS_SUCCESS;
+	}
+
+}
+
+
+TVMStatus VMThreadCreate(TVMThreadEntry entry, void *param, TVMMemorySize memsize, TVMThreadPriority prio, TVMThreadIDRef tid){
+	if(entry == NULL || tid == NULL){
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+
+	TCB *NewThread = new TCB();
+	NewThread->ID = allThreads.size();
+	*tid = NewThread->ID;
+	NewThread->priority = prio;
+	NewThread->state = VM_THREAD_STATE_DEAD;
+	NewThread->memSize = memsize;
+	NewThread->entry = entry;
+	NewThread->param = param;
+	NewThread->mcntxref = new SMachineContext;
+
+
+	// If idle thread set as global idle else put in ALl threads
+	if(prio == VM_THREAD_PRIORITY_IDLE)
+		IdleThread = NewThread;
+
+	allThreads.push_back(NewThread);
+	
+
+
+	return VM_STATUS_SUCCESS;
+}
+
+
+
+TVMStatus VMThreadActivate(TVMThreadID thread){
+	for(unsigned int i=0; i<allThreads.size();i++){
+		if(allThreads[i]->ID == thread){
+
+			// cout << "LOOK" << allThreads[i]->ID << endl; // *** ADDED COUT 
+
+			if(allThreads[i]->state != VM_THREAD_STATE_DEAD){
+				return VM_STATUS_ERROR_INVALID_STATE;
+			}
+			else{
+
+				char *stackArray = new char[allThreads[i]->memSize]; 
+
+
+				if(allThreads[i]->priority == VM_THREAD_PRIORITY_IDLE){
+				MachineContextCreate(allThreads[i]->mcntxref, allThreads[i]->entry, allThreads[i]->param, 
+					stackArray, allThreads[i]->memSize); //Need to change params maybe 					
+				}
+				else{
+				MachineContextCreate(allThreads[i]->mcntxref, Skeleton, allThreads[i], 
+					stackArray, allThreads[i]->memSize); //Need to change params maybe 
+				}
+
+				allThreads[i]->state = VM_THREAD_STATE_READY;
+
+				if(allThreads[i]->priority == VM_THREAD_PRIORITY_LOW)
+					lowThreads.push(allThreads[i]);
+				else if(allThreads[i]->priority == VM_THREAD_PRIORITY_NORMAL){
+					mediumThreads.push(allThreads[i]);
+				}
+				else if(allThreads[i]->priority == VM_THREAD_PRIORITY_HIGH)
+					highThreads.push(allThreads[i]);
+
+				return VM_STATUS_SUCCESS;
+			}
+		}
+	}
+	return VM_STATUS_ERROR_INVALID_ID;
+}
+
+TVMStatus VMThreadDelete(TVMThreadID thread){
+
+    for(unsigned int i = 0; i < allThreads.size(); i++){
+            if(allThreads[i]->ID == thread){
+                if(allThreads[i]->state != VM_THREAD_STATE_DEAD)
+                    return VM_STATUS_ERROR_INVALID_STATE;
+
+                allThreads.erase(allThreads.begin()+i);
+                return VM_STATUS_SUCCESS;
+            }
+        }
+
+        return VM_STATUS_ERROR_INVALID_ID;
+}
+
+TVMStatus VMThreadTerminate(TVMThreadID thread){
+	if(curThread->ID == thread){
+		//cout << "here you go" << endl;
+		curThread->state = VM_THREAD_STATE_DEAD;
+		Scheduler();
+	}
+	// if(curThread->ID == thread){
+	// 	cout << "here you go" << endl;
+	// 	Scheduler();
+	// }
+
+    for(unsigned int i = 0; i < allThreads.size(); i ++){
+        if(allThreads[i]->ID == thread){
+            if(allThreads[i]->ID == VM_THREAD_STATE_DEAD)
+                return VM_STATUS_ERROR_INVALID_STATE;
+            allThreads[i]->state = VM_THREAD_STATE_DEAD;
+            return VM_STATUS_SUCCESS;
+        }
+
+    }
+    return VM_STATUS_ERROR_INVALID_ID;
+
+}
+
+
+TVMStatus VMThreadID(TVMThreadIDRef threadref){
+	return VM_STATUS_SUCCESS;
+}
+TVMStatus VMThreadState(TVMThreadID thread, TVMThreadStateRef stateref){
+        if(stateref == NULL)
+            return VM_STATUS_ERROR_INVALID_PARAMETER;
+
+        for(unsigned int i = 0; i < allThreads.size(); i ++){
+           if(allThreads[i]->ID == thread){
+                *stateref = allThreads[i]->state;
+               return VM_STATUS_SUCCESS;
+           }
+        }
+        return VM_STATUS_ERROR_INVALID_ID;
+}
+
+TVMStatus VMThreadSleep(TVMTick tick){
+	if(tick == VM_TIMEOUT_INFINITE){
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+	else{
+		curThread->state = VM_THREAD_STATE_WAITING;
+		curThread->sleepTicks = tick;
+		sleepThreads.push_back(curThread);
+
+		Scheduler();
+		return VM_STATUS_SUCCESS;
+	}
+}
+
+
+
+TVMStatus VMFileOpen(const char *filename, int flags, int mode, int *filedescriptor){
+	if(filename == NULL || filedescriptor == NULL){
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+
+	curThread->state = VM_THREAD_STATE_WAITING;
+	MachineSuspendSignals(&curThread->signalState);
+	MachineFileOpen(filename, flags, mode, CallBackFile, curThread);
+	MachineResumeSignals(&curThread->signalState);
+	Scheduler();
+	*filedescriptor = curThread->result;
+
+	if(curThread->result >= 0)
+		return VM_STATUS_SUCCESS;
+	return VM_STATUS_FAILURE;
+} // FileOpen
+
+
+TVMStatus VMFileClose(int filedescriptor){
+	curThread->state = VM_THREAD_STATE_WAITING;
+	MachineSuspendSignals(&curThread->signalState);
+	MachineFileClose(filedescriptor, CallBackFile, curThread);
+	MachineResumeSignals(&curThread->signalState);
+	Scheduler();
+
+	if(curThread->result >= 0)
+		return VM_STATUS_SUCCESS;
+
+	return VM_STATUS_FAILURE;
+} // FileClose
+
+
+TVMStatus VMFileRead(int filedescriptor, void *data, int *length){
+	if(data == NULL || length == NULL)
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+
+	curThread->state = VM_THREAD_STATE_WAITING;
+	MachineSuspendSignals(&curThread->signalState);
+	MachineFileRead(filedescriptor, data, *length, CallBackFile, curThread);
+	MachineResumeSignals(&curThread->signalState);
+	Scheduler();
+
+	*length = curThread->result;
+
+	if(curThread->result >= 0)
+		return VM_STATUS_SUCCESS;
+	return VM_STATUS_FAILURE;
+} //FileRead
+
+
+TVMStatus VMFileWrite(int filedescriptor, void *data, int *length){
+	if(data == NULL || length == NULL)
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+
+
+	curThread->state = VM_THREAD_STATE_WAITING;
+	MachineSuspendSignals(&curThread->signalState);
+	MachineFileWrite(filedescriptor, data, *length, CallBackFile, curThread);
+	MachineResumeSignals(&curThread->signalState);
+	Scheduler();
+
+	return VM_STATUS_SUCCESS;
+} //Filewrite
+
+
+
+TVMStatus VMFileSeek(int filedescriptor, int offset, int whence, int *newoffset){
+
+	curThread->state = VM_THREAD_STATE_WAITING;
+	MachineSuspendSignals(&curThread->signalState);
+	MachineFileSeek(filedescriptor, offset, whence, CallBackFile, curThread);
+	MachineResumeSignals(&curThread->signalState);
+
+	Scheduler();
+
+	*newoffset = curThread->result;
+
+	if(curThread->result >= 0)
+		return VM_STATUS_SUCCESS;
+	
+	return VM_STATUS_FAILURE;
+} // FileSeek
+
+
+TVMStatus VMTickMS(int *tickmsref){
+	if(tickmsref == NULL)
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+
+
+	return VM_STATUS_SUCCESS;
+} //TickMS
+
+TVMStatus VMTickCount(TVMTickRef tickref){
+	if(tickref == NULL)
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	else{
+		tickref = globalTicks;
+	}
+
+	return VM_STATUS_SUCCESS;
+
+}// TickCount
+
+
+
+/* CALL BACKS */
+
+void CallBackFile(void* ptr, int result){
+	TCB* temp = (TCB*)ptr;
+	temp->result = result;
+	temp->state = VM_THREAD_STATE_READY;
+
+	if(temp->priority == VM_THREAD_PRIORITY_HIGH)
+		highThreads.push(temp);
+	else if(temp->priority == VM_THREAD_PRIORITY_NORMAL)
+		mediumThreads.push(temp);
+	else lowThreads.push(temp);
+	Scheduler();
+
+}
+
+
+
+//WORKS
+void MachineAlarmCallback(void* calldata){
+	// globalTicks++;
+
+	for(unsigned int i=0;i<sleepThreads.size();i++){
+		sleepThreads[i]->sleepTicks--;
+		if(sleepThreads[i]->sleepTicks == 0){
+			sleepThreads[i]->state = VM_THREAD_STATE_READY;
+	
+		if(sleepThreads[i]->priority == VM_THREAD_PRIORITY_HIGH)
+			highThreads.push(sleepThreads[i]);
+		else if(sleepThreads[i]->priority == VM_THREAD_PRIORITY_NORMAL)
+			mediumThreads.push(sleepThreads[i]);
+		else lowThreads.push(sleepThreads[i]);			
+		
+		sleepThreads.erase(sleepThreads.begin()+i);
+		Scheduler();
+		}
+	}
+}
+
+
+void Scheduler(){
+	 //cout << "IN SCHEDULAR: " << endl;
+
+
+	// cout << allThreads.size() << endl;
+	TCB* Old = curThread;
+	TCB* New = NULL;
+	//Old->state = VM_THREAD_STATE_WAITING;
+
+	 //cout << "In scheudlared" << endl;
+   if(curThread->state == VM_THREAD_STATE_RUNNING && curThread->priority != VM_THREAD_PRIORITY_IDLE){
+        //cout << "VOID RETURN" << endl;
+       return;
+   }
+
+    //cout << mediumThreads.size() << endl;
+   if(highThreads.size()){
+   		New = highThreads.top();
+   		curThread = New;
+   		highThreads.pop();
+   }else if(mediumThreads.size()){
+   		New = mediumThreads.top();
+   		curThread = New;
+   		mediumThreads.pop();
+   		// cout << "scheudlared" << endl;
+   }else if(lowThreads.size()){
+   		New = lowThreads.top();
+   		curThread = New;
+   		lowThreads.pop();
+   }else {
+   		New = IdleThread;
+   		//cout << "switch to idle" << endl;
+   		curThread = New;
+   		//cout << "IDLE scheudlared" << endl;
+   }
+
+   New->state = VM_THREAD_STATE_RUNNING;
+
+ // cout << Old->ID << " " << New->ID << endl;
+   MachineContextSwitch(Old->mcntxref, New->mcntxref);
+    //cout << curThread->ID << endl;
+   return;
+
+
+
+}
+
+
+void IdleThreadFunction(void*){
+	while(true){}
+}
+
+
+void Skeleton(void* ptr){
+	TCB* temp = (TCB*)ptr;
+	temp->entry(temp->param);
+	VMThreadTerminate(temp->ID);
+}
+
+
+TVMStatus VMMutexCreate(TVMMutexIDRef mutexref){
+	if(mutexref == NULL)
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+
+	mutex *Mut = new mutex();
+	Mut->state = 0;
+	allMutexs.push_back(Mut);
+	Mut->ID = allMutexs.size();
+	*mutexref = Mut->ID;
+
+	return VM_STATUS_SUCCESS;
+}
+
+TVMStatus VMMutexDelete(TVMMutexID mutex){
+	for(unsigned int i = 0; i < allMutexs.size(); i++){
+		if(mutex == allMutexs[i]->ID){
+			if(allMutexs[i]->state == 0){
+				allMutexs.erase(allMutexs.begin() + i);
+				return VM_STATUS_SUCCESS;
+			}else{
+				return VM_STATUS_ERROR_INVALID_STATE;
+			}
+		}
+	}
+	return VM_STATUS_ERROR_INVALID_ID;
+}
+
+TVMStatus VMMutexQuery(TVMMutexID mutex, TVMThreadIDRef ownerref){
+	if(ownerref == NULL){
+		return VM_STATUS_ERROR_INVALID_PARAMETER;
+	}
+	for(unsigned int i = 0; i < allMutexs.size(); i++){
+		if(mutex == allMutexs[i]->ID){
+			*ownerref = allMutexs[i]->curHolder->ID;
+			return VM_STATUS_SUCCESS;
+		}
+	}
+
+	return VM_STATUS_ERROR_INVALID_ID;
+}
+
+TVMStatus VMMutexAcquire(TVMMutexID mutex, TVMTick timeout){
+	for(unsigned int i = 0; i < allMutexs.size(); i++){
+		if(mutex == allMutexs[i]->ID){
+
+			//If mutex is not held by anyone just take it
+			if(allMutexs[i]->state != 1){
+				allMutexs[i]->state = 1;
+				return VM_STATUS_SUCCESS;
+			}
+
+			//Otherwise the mutex is held
+			else{
+				if(timeout == VM_TIMEOUT_IMMEDIATE)
+					return VM_STATUS_FAILURE;
+				else if(timeout == VM_TIMEOUT_INFINITE){
+					cout << " WE GOTTA WAIT" << endl;
+				}
+				else{
+					curThread->mutexWaitTicks = timeout;
+					if(curThread->priority == VM_THREAD_PRIORITY_LOW)
+						allMutexs[i]->lowPriority.push(curThread);
+					if(curThread->priority == VM_THREAD_PRIORITY_NORMAL)
+						allMutexs[i]->mediumPriority.push(curThread);
+					if(curThread->priority == VM_THREAD_PRIORITY_HIGH)
+						allMutexs[i]->highPriority.push(curThread);
+
+					// curThread->state == VM_THREAD_STATE_WAITING;
+
+				}
+			}
+		}
+	}
+
+
+	return VM_STATUS_SUCCESS;
+}
+
+TVMStatus VMMutexRelease(TVMMutexID mutex){
+	return VM_STATUS_SUCCESS;
+}

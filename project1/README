@@ -1,0 +1,4 @@
+William Herr 998103103
+Boyang Chen  998933470
+
+We used several online resources to complete this project. First we used the man pages for the system calls and also looked at the examples provided at http://www.tutorialspoint.com/unix_system_calls. Furthermore for pipe we used https://www.cs.rutgers.edu/~pxk/416/notes/c-tutorials/pipe.html as an example.
